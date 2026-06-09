@@ -158,7 +158,7 @@ class OpenAICompatibleLLM(LLMClient):
         if not endpoint.endswith("/chat/completions"):
             endpoint = f"{endpoint}/chat/completions"
 
-        payload = {
+        request_payload = {
             "model": self.config.llm.model,
             "messages": messages,
             "temperature": self.config.llm.temperature,
@@ -171,7 +171,7 @@ class OpenAICompatibleLLM(LLMClient):
         def do_request() -> dict[str, Any]:
             request = Request(
                 endpoint,
-                data=json.dumps(payload).encode("utf-8"),
+                data=json.dumps(request_payload).encode("utf-8"),
                 headers=headers,
                 method="POST",
             )
@@ -184,10 +184,10 @@ class OpenAICompatibleLLM(LLMClient):
             except URLError as exc:
                 raise RuntimeError(f"LLM request failed: {exc}") from exc
 
-            payload = json.loads(raw)
-            choices = payload.get("choices") or []
+            response_payload = json.loads(raw)
+            choices = response_payload.get("choices") or []
             if not choices:
-                raise RuntimeError(f"LLM response missing choices: {payload}")
+                raise RuntimeError(f"LLM response missing choices: {response_payload}")
             content = (
                 choices[0]
                 .get("message", {})
