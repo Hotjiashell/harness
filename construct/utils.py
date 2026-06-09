@@ -4,10 +4,13 @@ import asyncio
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Awaitable, Callable, Iterable, TypeVar
+from typing import TYPE_CHECKING, Awaitable, Callable, Iterable, TypeVar
 
 
 T = TypeVar("T")
+
+if TYPE_CHECKING:
+    from .reporting import ConsoleReporter
 
 ENGLISH_STOP_WORDS = {
     "appdata",
@@ -89,11 +92,35 @@ def truncate(text: str, limit: int = 80) -> str:
 async def bounded_gather(
     factories: list[Callable[[], Awaitable[T]]],
     concurrency: int,
+    reporter: "ConsoleReporter | None" = None,
+    progress_label: str = "",
 ) -> list[T]:
+    if not factories:
+        return []
+
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
-    async def run(factory: Callable[[], Awaitable[T]]) -> T:
+    async def run(index: int, factory: Callable[[], Awaitable[T]]) -> tuple[int, T]:
         async with semaphore:
-            return await factory()
+            return index, await factory()
 
-    return await asyncio.gather(*(run(factory) for factory in factories))
+    tasks = [asyncio.create_task(run(index, factory)) for index, factory in enumerate(factories)]
+    results: list[T | None] = [None] * len(tasks)
+    progress = reporter.progress(len(tasks), progress_label) if reporter and progress_label else None
+
+    try:
+        for task in asyncio.as_completed(tasks):
+            index, value = await task
+            results[index] = value
+            if progress is not None:
+                progress.update(1)
+    except Exception:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    finally:
+        if progress is not None:
+            progress.close()
+
+    return [value for value in results if value is not None]

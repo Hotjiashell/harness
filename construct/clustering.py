@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 from cluster import cluster as external_cluster
 from config import ClusterSettings
@@ -10,18 +10,31 @@ from config import ClusterSettings
 from .models import ClusterGroup, ClusterItem
 from .utils import split_mixed_tokens
 
+if TYPE_CHECKING:
+    from .reporting import ConsoleReporter
+
 
 async def cluster_items(
     items: list[ClusterItem],
     settings: ClusterSettings,
+    reporter: "ConsoleReporter | None" = None,
+    label: str = "",
 ) -> list[ClusterGroup]:
     if not items:
         return []
     if len(items) == 1:
         return [ClusterGroup(cluster_id="cluster_0", source=items[0].source, items=items[:])]
 
+    if reporter is not None:
+        target = label or items[0].source
+        reporter.info(
+            f"Clustering {len(items)} items for {target} with method={settings.method}"
+        )
+
     assignments = await _cluster_assignments([item.text for item in items], settings)
     if not assignments or len(assignments) != len(items):
+        if reporter is not None:
+            reporter.warn("External cluster backend unavailable, using local fallback clustering")
         assignments = _local_cluster_assignments([item.text for item in items], settings)
 
     grouped: dict[int, list[ClusterItem]] = defaultdict(list)
@@ -51,6 +64,9 @@ async def cluster_items(
                 items=cluster_items_list,
             )
         )
+    if reporter is not None:
+        target = label or items[0].source
+        reporter.info(f"Clustering finished for {target}: {len(result)} clusters")
     return result
 
 

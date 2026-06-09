@@ -101,6 +101,9 @@
   - `new_l1_min_cases`
   - `min_cases_to_split`
   - `software_alias_min_match`
+  - `console_output`
+  - `log_timestamps`
+  - `progress_bar_width`
 
 ## 4. 运行方式
 
@@ -117,6 +120,13 @@ python3 -m construct
 - 先验证流程是否能跑通
 - 观察中间结果
 - 外部 LLM / Embedding 服务暂未接通
+
+运行时控制台会输出：
+
+- 当前阶段，例如 `Build L1`、`Build L2/L3`
+- 当前正在展开的节点路径
+- 批量 LLM 调用的 `tqdm` 进度条
+- 聚类开始 / 完成和回退信息
 
 ### 指定真实模型服务
 

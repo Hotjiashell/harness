@@ -15,20 +15,32 @@ from .models import (
     DiscoveryResult,
     KnowledgeNode,
 )
+from .reporting import ConsoleReporter
 from .utils import bounded_gather, normalize_software_name
 
 
 class L1Builder:
-    def __init__(self, config: HarnessConfig, llm_client: LLMClient, stage_dir):
+    def __init__(
+        self,
+        config: HarnessConfig,
+        llm_client: LLMClient,
+        stage_dir,
+        reporter: ConsoleReporter,
+    ):
         self.config = config
         self.llm = llm_client
         self.stage_dir = stage_dir
+        self.reporter = reporter
 
     async def build(
         self,
         cases: list[CaseRecord],
         seed_nodes: list[KnowledgeNode],
     ) -> KnowledgeNode:
+        self.reporter.section(
+            "Stage 1: Build L1",
+            f"cases={len(cases)} seed_l1={len(seed_nodes)}",
+        )
         classification_results = await self._classify_cases(cases, seed_nodes)
         write_json(
             self.stage_dir / "01_l1_classification.json",
@@ -44,24 +56,33 @@ class L1Builder:
             else:
                 case = next(case for case in cases if case.case_id == result.case_id)
                 unmatched_cases.append(case)
+        self.reporter.info(
+            f"L1 classification complete: matched={len(cases) - len(unmatched_cases)} unmatched={len(unmatched_cases)}"
+        )
 
         discoveries = await self._discover_cases(unmatched_cases)
         write_json(
             self.stage_dir / "02_new_category_discovery.json",
             [item.to_dict() for item in discoveries],
         )
+        if discoveries:
+            self.reporter.info(f"Discovered {len(discoveries)} unmatched case summaries")
+        else:
+            self.reporter.info("No unmatched cases, skipping new-category discovery")
 
         clusters = await self._build_candidate_clusters(discoveries)
         write_json(
             self.stage_dir / "03_candidate_clusters.json",
             [group.to_dict() for group in clusters],
         )
+        self.reporter.info(f"Generated {len(clusters)} candidate clusters")
 
         new_large_nodes: list[KnowledgeNode] = []
         others_children: list[KnowledgeNode] = []
         candidate_summaries: list[dict[str, object]] = []
 
         cases_by_id = {case.case_id: case for case in cases}
+        progress = self.reporter.progress(len(clusters), "Summarize candidate clusters")
         for cluster_group in clusters:
             cluster_cases = [cases_by_id[case_id] for case_id in cluster_group.case_ids]
             summary = await self.llm.summarize_candidate_cluster(cluster_group, cluster_cases)
@@ -83,8 +104,13 @@ class L1Builder:
             else:
                 node.depth = 2
                 others_children.append(node)
+            progress.update(1)
+        progress.close()
 
         write_json(self.stage_dir / "04_candidate_nodes.json", candidate_summaries)
+        self.reporter.info(
+            f"Candidate node summary complete: new_l1={len(new_large_nodes)} others_children={len(others_children)}"
+        )
 
         root = KnowledgeNode(
             name="Root",
@@ -128,6 +154,7 @@ class L1Builder:
 
         root.children = all_children
         write_json(self.stage_dir / "05_initial_root.json", root.to_debug_dict())
+        self.reporter.info(f"Initial root built with {len(root.children)} L1 children")
         return root
 
     async def _classify_cases(
@@ -139,13 +166,23 @@ class L1Builder:
             (lambda case=case: self.llm.classify_case(case, seed_nodes))
             for case in cases
         ]
-        return await bounded_gather(factories, self.config.llm.concurrency)
+        return await bounded_gather(
+            factories,
+            self.config.llm.concurrency,
+            reporter=self.reporter,
+            progress_label="L1 case classification",
+        )
 
     async def _discover_cases(self, cases: list[CaseRecord]) -> list[DiscoveryResult]:
         if not cases:
             return []
         factories = [(lambda case=case: self.llm.discover_case(case)) for case in cases]
-        return await bounded_gather(factories, self.config.llm.concurrency)
+        return await bounded_gather(
+            factories,
+            self.config.llm.concurrency,
+            reporter=self.reporter,
+            progress_label="Discover unmatched cases",
+        )
 
     async def _build_candidate_clusters(
         self,
@@ -177,7 +214,12 @@ class L1Builder:
     async def _cluster_non_software(self, items: list[ClusterItem]) -> list[ClusterGroup]:
         if not items:
             return []
-        return await cluster_items(items, self.config.cluster)
+        return await cluster_items(
+            items,
+            self.config.cluster,
+            reporter=self.reporter,
+            label="non-software L1 discovery",
+        )
 
     async def _cluster_software(self, items: list[ClusterItem]) -> list[ClusterGroup]:
         if not items:
@@ -234,6 +276,11 @@ class L1Builder:
                     )
                 )
                 continue
-            grouped = await cluster_items(group_items, self.config.cluster)
+            grouped = await cluster_items(
+                group_items,
+                self.config.cluster,
+                reporter=self.reporter,
+                label=f"software L1 discovery:{software_name}",
+            )
             clusters.extend(grouped)
         return clusters
