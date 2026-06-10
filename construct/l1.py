@@ -168,7 +168,12 @@ class L1Builder:
         non_software_clusters = await self._cluster_non_software(non_software_items)
         cluster_debug["non_software_clusters"] = [group.to_dict() for group in non_software_clusters]
         self.reporter.info(f"Generated {len(non_software_clusters)} candidate clusters")
-        non_software_nodes = await self._clusters_to_nodes(non_software_clusters, cases_by_id)
+        non_software_nodes = await self._clusters_to_nodes(
+            non_software_clusters,
+            cases_by_id,
+            progress_label="Summarize non-software L1 nodes",
+            log_label="non-software L1 nodes",
+        )
         node_debug["non_software_nodes"] = [entry for entry in non_software_nodes["debug"]]
         new_large_nodes.extend(non_software_nodes["new_l1"])
         others_children.extend(non_software_nodes["others"])
@@ -252,14 +257,25 @@ class L1Builder:
         self,
         clusters: list[ClusterGroup],
         cases_by_id: dict[str, CaseRecord],
+        progress_label: str = "Summarize candidate clusters",
+        log_label: str = "candidate clusters",
     ) -> dict[str, object]:
         new_l1: list[KnowledgeNode] = []
         others: list[KnowledgeNode] = []
         debug_entries: list[dict[str, object]] = []
-        progress = self.reporter.progress(len(clusters), "Summarize candidate clusters")
-        for cluster_group in clusters:
-            cluster_cases = [cases_by_id[case_id] for case_id in cluster_group.case_ids]
-            summary = await self._summarize_candidate_cluster(cluster_group, cluster_cases)
+        payloads = [
+            (
+                cluster_group,
+                [cases_by_id[case_id] for case_id in cluster_group.case_ids],
+            )
+            for cluster_group in clusters
+        ]
+        summaries = await self._summarize_candidate_clusters_batch(
+            payloads,
+            progress_label=progress_label,
+            log_label=log_label,
+        )
+        for (cluster_group, _), summary in zip(payloads, summaries):
             node = KnowledgeNode(
                 name=summary.name,
                 trigger=summary.trigger,
@@ -280,8 +296,6 @@ class L1Builder:
                 new_l1.append(node)
             else:
                 others.append(node)
-            progress.update(1)
-        progress.close()
         return {
             "new_l1": new_l1,
             "others": others,
@@ -403,7 +417,7 @@ class L1Builder:
 
         small_function_items: list[ClusterItem] = []
         small_node_map: dict[str, KnowledgeNode] = {}
-
+        group_payloads: list[tuple[str, ClusterGroup, list[CaseRecord], bool, str]] = []
         for index, (software_name, group_items) in enumerate(grouped_by_name.items(), start=1):
             group_cluster = ClusterGroup(
                 cluster_id=f"software_group_{software_name or index}",
@@ -412,14 +426,28 @@ class L1Builder:
             )
             all_clusters.append(group_cluster)
             cluster_cases = [cases_by_id[item.case_id] for item in group_items]
+            is_direct_l1 = len(group_items) >= self.config.pipeline.new_l1_min_cases
+            pseudo_id = f"software_function_{software_name or index}"
+            group_payloads.append((software_name, group_cluster, cluster_cases, is_direct_l1, pseudo_id))
 
-            if len(group_items) >= self.config.pipeline.new_l1_min_cases:
-                summary = await self._summarize_candidate_cluster(group_cluster, cluster_cases)
+        direct_group_count = sum(1 for _, _, _, is_direct_l1, _ in group_payloads if is_direct_l1)
+        regroup_group_count = len(group_payloads) - direct_group_count
+        self.reporter.info(
+            f"Software name groups ready: total={len(group_payloads)} direct_l1={direct_group_count} regroup={regroup_group_count}"
+        )
+        group_summaries = await self._summarize_candidate_clusters_batch(
+            [(group_cluster, cluster_cases) for _, group_cluster, cluster_cases, _, _ in group_payloads],
+            progress_label="Summarize software name groups",
+            log_label="software name groups",
+        )
+
+        for (software_name, group_cluster, _, is_direct_l1, pseudo_id), summary in zip(group_payloads, group_summaries):
+            if is_direct_l1:
                 node = KnowledgeNode(
                     name=summary.name,
                     trigger=summary.trigger,
                     background=summary.background,
-                    case_ids=[item.case_id for item in group_items],
+                    case_ids=group_cluster.case_ids,
                 )
                 direct_l1_nodes.append(node)
                 direct_l1_debug.append(
@@ -432,14 +460,12 @@ class L1Builder:
                 )
                 continue
 
-            summary = await self._summarize_candidate_cluster(group_cluster, cluster_cases)
             small_node = KnowledgeNode(
                 name=summary.name,
                 trigger=summary.trigger,
                 background=summary.background,
-                case_ids=[item.case_id for item in group_items],
+                case_ids=group_cluster.case_ids,
             )
-            pseudo_id = f"software_function_{software_name or index}"
             small_node_map[pseudo_id] = small_node
             small_function_items.append(
                 ClusterItem(
@@ -467,7 +493,7 @@ class L1Builder:
         )
         all_clusters.extend(function_clusters)
 
-        progress = self.reporter.progress(len(function_clusters), "Summarize software big nodes")
+        big_payloads: list[tuple[ClusterGroup, list[KnowledgeNode], list[str], list[CaseRecord]]] = []
         for function_cluster in function_clusters:
             child_nodes = [small_node_map[pseudo_id] for pseudo_id in function_cluster.case_ids]
             big_case_ids = list(
@@ -478,7 +504,15 @@ class L1Builder:
                 )
             )
             cluster_cases = [cases_by_id[case_id] for case_id in big_case_ids]
-            summary = await self._summarize_candidate_cluster(function_cluster, cluster_cases)
+            big_payloads.append((function_cluster, child_nodes, big_case_ids, cluster_cases))
+
+        big_summaries = await self._summarize_candidate_clusters_batch(
+            [(function_cluster, cluster_cases) for function_cluster, _, _, cluster_cases in big_payloads],
+            progress_label="Summarize software big nodes",
+            log_label="software big nodes",
+        )
+
+        for (function_cluster, child_nodes, big_case_ids, _), summary in zip(big_payloads, big_summaries):
             big_node = KnowledgeNode(
                 name=summary.name,
                 trigger=summary.trigger,
@@ -500,8 +534,6 @@ class L1Builder:
                     "children": [child.to_debug_dict() for child in child_nodes],
                 }
             )
-            progress.update(1)
-        progress.close()
 
         return {
             "new_l1": direct_l1_nodes,
@@ -684,3 +716,81 @@ class L1Builder:
                     trigger=f"当问题表现为{name}相关场景时考虑该类别",
                     background=f"{name}为回退生成的候选类别，请结合原始案例进一步校验。",
                 )
+
+    async def _summarize_candidate_clusters_batch(
+        self,
+        payloads: list[tuple[ClusterGroup, list[CaseRecord]]],
+        progress_label: str,
+        log_label: str,
+    ) -> list[NodeSummary]:
+        if not payloads:
+            return []
+
+        self.reporter.info(f"Summarizing {log_label}: count={len(payloads)}")
+        outcomes = await bounded_gather_outcomes(
+            [
+                (
+                    lambda cluster_group=cluster_group, cluster_cases=cluster_cases:
+                    self.llm.summarize_candidate_cluster(cluster_group, cluster_cases)
+                )
+                for cluster_group, cluster_cases in payloads
+            ],
+            self.config.llm.concurrency,
+            reporter=self.reporter,
+            progress_label=f"{progress_label} ({len(payloads)})",
+        )
+        summaries: list[NodeSummary] = []
+        for (cluster_group, cluster_cases), outcome in zip(payloads, outcomes):
+            summaries.append(
+                await self._resolve_candidate_cluster_summary_outcome(
+                    cluster_group,
+                    cluster_cases,
+                    outcome,
+                )
+            )
+        return summaries
+
+    async def _resolve_candidate_cluster_summary_outcome(
+        self,
+        cluster_group: ClusterGroup,
+        cluster_cases: list[CaseRecord],
+        outcome: TaskOutcome[NodeSummary],
+    ) -> NodeSummary:
+        if outcome.ok and outcome.value is not None:
+            return outcome.value
+
+        assert outcome.error is not None
+        self.reporter.warn(
+            f"Candidate cluster summary failed for {cluster_group.cluster_id}, using heuristic fallback"
+        )
+        try:
+            summary = await self.fallback_llm.summarize_candidate_cluster(cluster_group, cluster_cases)
+            self.audit.record_item_failure(
+                stage="l1_candidate_cluster_summary",
+                item_type="cluster",
+                item_id=cluster_group.cluster_id,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=True,
+                details={"case_ids": cluster_group.case_ids},
+            )
+            return summary
+        except Exception as fallback_error:  # noqa: BLE001
+            self.audit.record_item_failure(
+                stage="l1_candidate_cluster_summary",
+                item_type="cluster",
+                item_id=cluster_group.cluster_id,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=False,
+                details={
+                    "case_ids": cluster_group.case_ids,
+                    "fallback_error": str(fallback_error),
+                },
+            )
+            name = truncate(cluster_cases[0].case_name, 24) if cluster_cases else cluster_group.cluster_id
+            return NodeSummary(
+                name=name,
+                trigger=f"当问题表现为{name}相关场景时考虑该类别",
+                background=f"{name}为回退生成的候选类别，请结合原始案例进一步校验。",
+            )
