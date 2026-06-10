@@ -3,14 +3,26 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable, Iterable, TypeVar
+from typing import TYPE_CHECKING, Awaitable, Callable, Generic, Iterable, TypeVar
 
 
 T = TypeVar("T")
 
 if TYPE_CHECKING:
     from .reporting import ConsoleReporter
+
+
+@dataclass
+class TaskOutcome(Generic[T]):
+    index: int
+    value: T | None = None
+    error: Exception | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
 
 ENGLISH_STOP_WORDS = {
     "appdata",
@@ -124,3 +136,38 @@ async def bounded_gather(
             progress.close()
 
     return [value for value in results if value is not None]
+
+
+async def bounded_gather_outcomes(
+    factories: list[Callable[[], Awaitable[T]]],
+    concurrency: int,
+    reporter: "ConsoleReporter | None" = None,
+    progress_label: str = "",
+) -> list[TaskOutcome[T]]:
+    if not factories:
+        return []
+
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def run(index: int, factory: Callable[[], Awaitable[T]]) -> TaskOutcome[T]:
+        async with semaphore:
+            try:
+                return TaskOutcome(index=index, value=await factory())
+            except Exception as exc:  # noqa: BLE001
+                return TaskOutcome(index=index, error=exc)
+
+    tasks = [asyncio.create_task(run(index, factory)) for index, factory in enumerate(factories)]
+    results: list[TaskOutcome[T] | None] = [None] * len(tasks)
+    progress = reporter.progress(len(tasks), progress_label) if reporter and progress_label else None
+
+    try:
+        for task in asyncio.as_completed(tasks):
+            outcome = await task
+            results[outcome.index] = outcome
+            if progress is not None:
+                progress.update(1)
+    finally:
+        if progress is not None:
+            progress.close()
+
+    return [result for result in results if result is not None]

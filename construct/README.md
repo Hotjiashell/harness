@@ -205,6 +205,10 @@ output/harness
   包含 `depth`、`path`、`case_ids` 的调试版本
 - `run_config.json`
   本次运行的配置快照
+- `error_audit.json`
+  全流程错误审计汇总，包含阶段分布、错误明细、是否使用回退
+- `failed_cases.json`
+  以案例维度聚合的失败事件清单
 
 ### 中间结果
 
@@ -256,7 +260,23 @@ output/_skills/harness
 
 这个导出适合后续做节点级消费、检索或调试。
 
-## 7. 关键实现说明
+## 7. 单案例失败与错误审计
+
+当前实现已经支持“单案例失败不拖垮整批”：
+
+- `L1` 案例分类
+- 未命中案例的新类别发现
+- 递归建树时的父节点下案例总结
+
+以上阶段如果某个案例的主 LLM 调用失败：
+
+1. 不会中断整批任务
+2. 会记录到 `error_audit.json` 和 `failed_cases.json`
+3. 会自动回退到 `heuristic` 逻辑继续处理
+
+如果 `heuristic` 回退也失败，则使用最小默认结果，保证流程尽量继续向下执行。
+
+## 8. 关键实现说明
 
 ### 关于 `cluster.py`
 
@@ -280,7 +300,7 @@ output/_skills/harness
 provider = openai-compatible
 ```
 
-## 8. 常见修改入口
+## 9. 常见修改入口
 
 如果要继续演进实现，通常从这些位置开始：
 
@@ -291,14 +311,14 @@ provider = openai-compatible
 - 切换真实模型调用：`llm.py`
 - 接入真实 embedding 聚类：根目录 `cluster.py`
 
-## 9. 当前限制
+## 10. 当前限制
 
 - 默认 `heuristic` 模式下，节点命名仍偏工程回退风格，不代表最终效果上限
 - 当前 `cluster.py` 仍未实现真实向量聚类
 - CLI 只提供了 `--provider` 覆盖，其他参数仍通过 `config.py` 配置
 - `output/_skills/harness` 目前导出的是节点目录结构，不是完整可执行 skill 包
 
-## 10. 推荐使用顺序
+## 11. 推荐使用顺序
 
 1. 先用 `python3 -m construct` 验证流程和输出结构
 2. 检查 `output/harness/intermediate` 中的各阶段结果

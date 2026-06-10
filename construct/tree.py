@@ -5,12 +5,13 @@ from pathlib import Path
 
 from config import HarnessConfig
 
+from .audit import ErrorAuditCollector
 from .clustering import cluster_items
 from .io_utils import write_json
-from .llm import LLMClient
-from .models import CaseRecord, ClusterGroup, ClusterItem, KnowledgeNode
+from .llm import HeuristicLLM, LLMClient
+from .models import CaseRecord, ClusterGroup, ClusterItem, KnowledgeNode, NodeSummary
 from .reporting import ConsoleReporter
-from .utils import bounded_gather, slugify
+from .utils import TaskOutcome, bounded_gather_outcomes, slugify, truncate
 
 
 class RecursiveTreeBuilder:
@@ -21,12 +22,15 @@ class RecursiveTreeBuilder:
         stage_dir: Path,
         cases_by_id: dict[str, CaseRecord],
         reporter: ConsoleReporter,
+        audit: ErrorAuditCollector,
     ) -> None:
         self.config = config
         self.llm = llm_client
         self.stage_dir = stage_dir
         self.cases_by_id = cases_by_id
         self.reporter = reporter
+        self.audit = audit
+        self.fallback_llm = HeuristicLLM(config)
 
     async def build(self, root: KnowledgeNode) -> None:
         self.reporter.section("Stage 2: Build L2/L3")
@@ -97,12 +101,16 @@ class RecursiveTreeBuilder:
             (lambda case=case: self.llm.summarize_case_under_parent(parent, case))
             for case in cases
         ]
-        return await bounded_gather(
+        outcomes = await bounded_gather_outcomes(
             factories,
             self.config.llm.concurrency,
             reporter=self.reporter,
             progress_label=f"Summarize cases for {parent.name}",
         )
+        summaries: list[str] = []
+        for case, outcome in zip(cases, outcomes):
+            summaries.append(await self._resolve_case_summary_outcome(parent, case, outcome))
+        return summaries
 
     async def _build_children(
         self,
@@ -137,12 +145,23 @@ class RecursiveTreeBuilder:
             )
             for cluster_group, cluster_cases, cluster_summaries in cluster_payloads
         ]
-        summaries = await bounded_gather(
+        outcomes = await bounded_gather_outcomes(
             factories,
             self.config.llm.concurrency,
             reporter=self.reporter,
             progress_label=f"Summarize child clusters for {parent.name}",
         )
+        summaries: list[NodeSummary] = []
+        for (cluster_group, cluster_cases, cluster_summaries), outcome in zip(cluster_payloads, outcomes):
+            summaries.append(
+                await self._resolve_child_cluster_summary_outcome(
+                    parent,
+                    cluster_group,
+                    cluster_cases,
+                    cluster_summaries,
+                    outcome,
+                )
+            )
 
         results: list[KnowledgeNode] = []
         for (cluster_group, _, _), summary in zip(cluster_payloads, summaries):
@@ -171,3 +190,97 @@ class RecursiveTreeBuilder:
     def _node_stage_name(self, node: KnowledgeNode) -> str:
         fallback = f"depth-{node.depth}"
         return slugify("-".join(node.path), fallback=fallback)
+
+    async def _resolve_case_summary_outcome(
+        self,
+        parent: KnowledgeNode,
+        case: CaseRecord,
+        outcome: TaskOutcome[str],
+    ) -> str:
+        if outcome.ok and outcome.value is not None:
+            return outcome.value
+
+        assert outcome.error is not None
+        self.reporter.warn(
+            f"Case summary failed for {case.case_id} under {' > '.join(parent.path)}, using heuristic fallback"
+        )
+        try:
+            summary = await self.fallback_llm.summarize_case_under_parent(parent, case)
+            self.audit.record_case_failure(
+                stage="tree_case_summary",
+                case=case,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=True,
+                details={"parent_path": parent.path},
+            )
+            return summary
+        except Exception as fallback_error:  # noqa: BLE001
+            self.audit.record_case_failure(
+                stage="tree_case_summary",
+                case=case,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=False,
+                details={
+                    "parent_path": parent.path,
+                    "fallback_error": str(fallback_error),
+                },
+            )
+            return truncate(case.case_name, 40)
+
+    async def _resolve_child_cluster_summary_outcome(
+        self,
+        parent: KnowledgeNode,
+        cluster_group: ClusterGroup,
+        cluster_cases: list[CaseRecord],
+        cluster_summaries: list[str],
+        outcome: TaskOutcome[NodeSummary],
+    ) -> NodeSummary:
+        if outcome.ok and outcome.value is not None:
+            return outcome.value
+
+        assert outcome.error is not None
+        self.reporter.warn(
+            f"Child cluster summary failed for {cluster_group.cluster_id} under {' > '.join(parent.path)}, using heuristic fallback"
+        )
+        try:
+            summary = await self.fallback_llm.summarize_child_cluster(
+                parent,
+                cluster_group,
+                cluster_cases,
+                cluster_summaries,
+            )
+            self.audit.record_item_failure(
+                stage="tree_child_cluster_summary",
+                item_type="cluster",
+                item_id=cluster_group.cluster_id,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=True,
+                details={
+                    "parent_path": parent.path,
+                    "case_ids": cluster_group.case_ids,
+                },
+            )
+            return summary
+        except Exception as fallback_error:  # noqa: BLE001
+            self.audit.record_item_failure(
+                stage="tree_child_cluster_summary",
+                item_type="cluster",
+                item_id=cluster_group.cluster_id,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=False,
+                details={
+                    "parent_path": parent.path,
+                    "case_ids": cluster_group.case_ids,
+                    "fallback_error": str(fallback_error),
+                },
+            )
+            name = truncate(cluster_summaries[0], 32) if cluster_summaries else cluster_group.cluster_id
+            return NodeSummary(
+                name=name,
+                trigger=f"当{parent.name}问题进一步表现为{name}方向时考虑该子类别",
+                background=f"{name}为回退生成的子类别，请结合原始案例进一步校验。",
+            )

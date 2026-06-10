@@ -6,7 +6,7 @@ from config import HarnessConfig
 
 from .clustering import cluster_items
 from .io_utils import write_json
-from .llm import LLMClient
+from .llm import HeuristicLLM, LLMClient
 from .models import (
     CaseRecord,
     ClassificationResult,
@@ -14,9 +14,11 @@ from .models import (
     ClusterItem,
     DiscoveryResult,
     KnowledgeNode,
+    NodeSummary,
 )
+from .audit import ErrorAuditCollector
 from .reporting import ConsoleReporter
-from .utils import bounded_gather, normalize_software_name
+from .utils import TaskOutcome, bounded_gather_outcomes, normalize_software_name, truncate
 
 
 class L1Builder:
@@ -26,11 +28,14 @@ class L1Builder:
         llm_client: LLMClient,
         stage_dir,
         reporter: ConsoleReporter,
+        audit: ErrorAuditCollector,
     ):
         self.config = config
         self.llm = llm_client
         self.stage_dir = stage_dir
         self.reporter = reporter
+        self.audit = audit
+        self.fallback_llm = HeuristicLLM(config)
 
     async def build(
         self,
@@ -85,7 +90,7 @@ class L1Builder:
         progress = self.reporter.progress(len(clusters), "Summarize candidate clusters")
         for cluster_group in clusters:
             cluster_cases = [cases_by_id[case_id] for case_id in cluster_group.case_ids]
-            summary = await self.llm.summarize_candidate_cluster(cluster_group, cluster_cases)
+            summary = await self._summarize_candidate_cluster(cluster_group, cluster_cases)
             candidate_summaries.append(
                 {
                     "cluster": cluster_group.to_dict(),
@@ -166,23 +171,31 @@ class L1Builder:
             (lambda case=case: self.llm.classify_case(case, seed_nodes))
             for case in cases
         ]
-        return await bounded_gather(
+        outcomes = await bounded_gather_outcomes(
             factories,
             self.config.llm.concurrency,
             reporter=self.reporter,
             progress_label="L1 case classification",
         )
+        results: list[ClassificationResult] = []
+        for case, outcome in zip(cases, outcomes):
+            results.append(await self._resolve_classification_outcome(case, seed_nodes, outcome))
+        return results
 
     async def _discover_cases(self, cases: list[CaseRecord]) -> list[DiscoveryResult]:
         if not cases:
             return []
         factories = [(lambda case=case: self.llm.discover_case(case)) for case in cases]
-        return await bounded_gather(
+        outcomes = await bounded_gather_outcomes(
             factories,
             self.config.llm.concurrency,
             reporter=self.reporter,
             progress_label="Discover unmatched cases",
         )
+        results: list[DiscoveryResult] = []
+        for case, outcome in zip(cases, outcomes):
+            results.append(await self._resolve_discovery_outcome(case, outcome))
+        return results
 
     async def _build_candidate_clusters(
         self,
@@ -284,3 +297,119 @@ class L1Builder:
             )
             clusters.extend(grouped)
         return clusters
+
+    async def _resolve_classification_outcome(
+        self,
+        case: CaseRecord,
+        seed_nodes: list[KnowledgeNode],
+        outcome: TaskOutcome[ClassificationResult],
+    ) -> ClassificationResult:
+        if outcome.ok and outcome.value is not None:
+            return outcome.value
+
+        assert outcome.error is not None
+        self.reporter.warn(f"L1 classification failed for {case.case_id}, using heuristic fallback")
+        try:
+            fallback = await self.fallback_llm.classify_case(case, seed_nodes)
+            fallback.reason = f"{fallback.reason}；主LLM失败后使用heuristic回退"
+            self.audit.record_case_failure(
+                stage="l1_classification",
+                case=case,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=True,
+            )
+            return fallback
+        except Exception as fallback_error:  # noqa: BLE001
+            self.audit.record_case_failure(
+                stage="l1_classification",
+                case=case,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=False,
+                details={"fallback_error": str(fallback_error)},
+            )
+            return ClassificationResult(
+                case_id=case.case_id,
+                belongs=False,
+                category_name=None,
+                reason="主LLM与heuristic回退均失败，按未匹配案例处理",
+            )
+
+    async def _resolve_discovery_outcome(
+        self,
+        case: CaseRecord,
+        outcome: TaskOutcome[DiscoveryResult],
+    ) -> DiscoveryResult:
+        if outcome.ok and outcome.value is not None:
+            return outcome.value
+
+        assert outcome.error is not None
+        self.reporter.warn(f"New-category discovery failed for {case.case_id}, using heuristic fallback")
+        try:
+            fallback = await self.fallback_llm.discover_case(case)
+            self.audit.record_case_failure(
+                stage="l1_discovery",
+                case=case,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=True,
+            )
+            return fallback
+        except Exception as fallback_error:  # noqa: BLE001
+            self.audit.record_case_failure(
+                stage="l1_discovery",
+                case=case,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=False,
+                details={"fallback_error": str(fallback_error)},
+            )
+            return DiscoveryResult(
+                case_id=case.case_id,
+                software_name="",
+                description=truncate(case.content, 60),
+            )
+
+    async def _summarize_candidate_cluster(
+        self,
+        cluster_group: ClusterGroup,
+        cluster_cases: list[CaseRecord],
+    ) -> NodeSummary:
+        try:
+            return await self.llm.summarize_candidate_cluster(cluster_group, cluster_cases)
+        except Exception as error:  # noqa: BLE001
+            self.reporter.warn(
+                f"Candidate cluster summary failed for {cluster_group.cluster_id}, using heuristic fallback"
+            )
+            try:
+                summary = await self.fallback_llm.summarize_candidate_cluster(cluster_group, cluster_cases)
+                self.audit.record_item_failure(
+                    stage="l1_candidate_cluster_summary",
+                    item_type="cluster",
+                    item_id=cluster_group.cluster_id,
+                    error=error,
+                    fallback="heuristic",
+                    fallback_succeeded=True,
+                    details={"case_ids": cluster_group.case_ids},
+                )
+                return summary
+            except Exception as fallback_error:  # noqa: BLE001
+                self.audit.record_item_failure(
+                    stage="l1_candidate_cluster_summary",
+                    item_type="cluster",
+                    item_id=cluster_group.cluster_id,
+                    error=error,
+                    fallback="heuristic",
+                    fallback_succeeded=False,
+                    details={
+                        "case_ids": cluster_group.case_ids,
+                        "fallback_error": str(fallback_error),
+                    },
+                )
+                name = truncate(cluster_cases[0].case_name, 24) if cluster_cases else cluster_group.cluster_id
+                return NodeSummary(
+                    name=name,
+                    trigger=f"当问题表现为{name}相关场景时考虑该类别",
+                    background=f"{name}为回退生成的候选类别，请结合原始案例进一步校验。",
+                )
