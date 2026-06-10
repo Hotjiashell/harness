@@ -75,44 +75,13 @@ class L1Builder:
         else:
             self.reporter.info("No unmatched cases, skipping new-category discovery")
 
-        clusters = await self._build_candidate_clusters(discoveries)
-        write_json(
-            self.stage_dir / "03_candidate_clusters.json",
-            [group.to_dict() for group in clusters],
-        )
-        self.reporter.info(f"Generated {len(clusters)} candidate clusters")
-
-        new_large_nodes: list[KnowledgeNode] = []
-        others_children: list[KnowledgeNode] = []
-        candidate_summaries: list[dict[str, object]] = []
-
         cases_by_id = {case.case_id: case for case in cases}
-        progress = self.reporter.progress(len(clusters), "Summarize candidate clusters")
-        for cluster_group in clusters:
-            cluster_cases = [cases_by_id[case_id] for case_id in cluster_group.case_ids]
-            summary = await self._summarize_candidate_cluster(cluster_group, cluster_cases)
-            candidate_summaries.append(
-                {
-                    "cluster": cluster_group.to_dict(),
-                    "summary": summary.to_dict(),
-                }
-            )
-            node = KnowledgeNode(
-                name=summary.name,
-                trigger=summary.trigger,
-                background=summary.background,
-                case_ids=cluster_group.case_ids,
-            )
-            if cluster_group.size >= self.config.pipeline.new_l1_min_cases:
-                node.depth = 1
-                new_large_nodes.append(node)
-            else:
-                node.depth = 2
-                others_children.append(node)
-            progress.update(1)
-        progress.close()
-
-        write_json(self.stage_dir / "04_candidate_nodes.json", candidate_summaries)
+        new_large_nodes, others_children, cluster_debug, node_debug = await self._build_unmatched_nodes(
+            discoveries,
+            cases_by_id,
+        )
+        write_json(self.stage_dir / "03_candidate_clusters.json", cluster_debug)
+        write_json(self.stage_dir / "04_candidate_nodes.json", node_debug)
         self.reporter.info(
             f"Candidate node summary complete: new_l1={len(new_large_nodes)} others_children={len(others_children)}"
         )
@@ -138,14 +107,14 @@ class L1Builder:
             all_children.append(child)
 
         for node in new_large_nodes:
-            node.path = ["Root", node.name]
+            self._set_subtree_location(node, depth=1, path=["Root", node.name])
             all_children.append(node)
 
         if others_children:
             others_case_ids: list[str] = []
             for child in others_children:
-                child.path = ["Root", "其他", child.name]
                 others_case_ids.extend(child.case_ids)
+                self._set_subtree_location(child, depth=2, path=["Root", "其他", child.name])
             others_node = KnowledgeNode(
                 name="其他",
                 trigger="当案例无法稳定归入已有L1且聚类规模较小时考虑该类别",
@@ -161,6 +130,61 @@ class L1Builder:
         write_json(self.stage_dir / "05_initial_root.json", root.to_debug_dict())
         self.reporter.info(f"Initial root built with {len(root.children)} L1 children")
         return root
+
+    async def _build_unmatched_nodes(
+        self,
+        discoveries: list[DiscoveryResult],
+        cases_by_id: dict[str, CaseRecord],
+    ) -> tuple[list[KnowledgeNode], list[KnowledgeNode], dict[str, object], dict[str, object]]:
+        software_items: list[ClusterItem] = []
+        non_software_items: list[ClusterItem] = []
+        for discovery in discoveries:
+            item = ClusterItem(
+                case_id=discovery.case_id,
+                text=discovery.description,
+                source="software" if discovery.software_name else "non_software",
+                software_name=discovery.software_name,
+                description=discovery.description,
+            )
+            if discovery.software_name.strip():
+                software_items.append(item)
+            else:
+                non_software_items.append(item)
+
+        new_large_nodes: list[KnowledgeNode] = []
+        others_children: list[KnowledgeNode] = []
+        cluster_debug: dict[str, object] = {
+            "non_software_clusters": [],
+            "software_name_groups": [],
+            "software_function_clusters": [],
+        }
+        node_debug: dict[str, object] = {
+            "non_software_nodes": [],
+            "direct_software_l1_nodes": [],
+            "software_small_nodes": [],
+            "software_big_nodes": [],
+        }
+
+        non_software_clusters = await self._cluster_non_software(non_software_items)
+        cluster_debug["non_software_clusters"] = [group.to_dict() for group in non_software_clusters]
+        self.reporter.info(f"Generated {len(non_software_clusters)} candidate clusters")
+        non_software_nodes = await self._clusters_to_nodes(non_software_clusters, cases_by_id)
+        node_debug["non_software_nodes"] = [entry for entry in non_software_nodes["debug"]]
+        new_large_nodes.extend(non_software_nodes["new_l1"])
+        others_children.extend(non_software_nodes["others"])
+
+        software_result = await self._build_software_nodes(software_items, cases_by_id)
+        cluster_debug["software_name_groups"] = software_result["cluster_debug"]["software_name_groups"]
+        cluster_debug["software_function_clusters"] = software_result["cluster_debug"]["software_function_clusters"]
+        node_debug["direct_software_l1_nodes"] = software_result["node_debug"]["direct_software_l1_nodes"]
+        node_debug["software_small_nodes"] = software_result["node_debug"]["software_small_nodes"]
+        node_debug["software_big_nodes"] = software_result["node_debug"]["software_big_nodes"]
+        new_large_nodes.extend(software_result["new_l1"])
+        others_children.extend(software_result["others"])
+        self.reporter.info(
+            f"Generated {len(non_software_clusters) + len(software_result['all_clusters'])} candidate clusters"
+        )
+        return new_large_nodes, others_children, cluster_debug, node_debug
 
     async def _classify_cases(
         self,
@@ -223,6 +247,46 @@ class L1Builder:
         clusters.extend(await self._cluster_non_software(non_software_items))
         clusters.extend(await self._cluster_software(software_items))
         return clusters
+
+    async def _clusters_to_nodes(
+        self,
+        clusters: list[ClusterGroup],
+        cases_by_id: dict[str, CaseRecord],
+    ) -> dict[str, object]:
+        new_l1: list[KnowledgeNode] = []
+        others: list[KnowledgeNode] = []
+        debug_entries: list[dict[str, object]] = []
+        progress = self.reporter.progress(len(clusters), "Summarize candidate clusters")
+        for cluster_group in clusters:
+            cluster_cases = [cases_by_id[case_id] for case_id in cluster_group.case_ids]
+            summary = await self._summarize_candidate_cluster(cluster_group, cluster_cases)
+            node = KnowledgeNode(
+                name=summary.name,
+                trigger=summary.trigger,
+                background=summary.background,
+                case_ids=cluster_group.case_ids,
+            )
+            debug_entries.append(
+                {
+                    "cluster": cluster_group.to_dict(),
+                    "summary": summary.to_dict(),
+                    "case_count": len(cluster_group.case_ids),
+                    "placement": "l1"
+                    if len(cluster_group.case_ids) >= self.config.pipeline.new_l1_min_cases
+                    else "others",
+                }
+            )
+            if len(cluster_group.case_ids) >= self.config.pipeline.new_l1_min_cases:
+                new_l1.append(node)
+            else:
+                others.append(node)
+            progress.update(1)
+        progress.close()
+        return {
+            "new_l1": new_l1,
+            "others": others,
+            "debug": debug_entries,
+        }
 
     async def _cluster_non_software(self, items: list[ClusterItem]) -> list[ClusterGroup]:
         if not items:
@@ -297,6 +361,213 @@ class L1Builder:
             )
             clusters.extend(grouped)
         return clusters
+
+    async def _build_software_nodes(
+        self,
+        items: list[ClusterItem],
+        cases_by_id: dict[str, CaseRecord],
+    ) -> dict[str, object]:
+        if not items:
+            return {
+                "new_l1": [],
+                "others": [],
+                "all_clusters": [],
+                "cluster_debug": {
+                    "software_name_groups": [],
+                    "software_function_clusters": [],
+                },
+                "node_debug": {
+                    "direct_software_l1_nodes": [],
+                    "software_small_nodes": [],
+                    "software_big_nodes": [],
+                },
+            }
+
+        grouped_by_name = self._group_software_items_by_name(items)
+        software_name_debug = [
+            {
+                "software_name": software_name,
+                "case_ids": [item.case_id for item in group_items],
+                "size": len(group_items),
+                "descriptions": [item.description for item in group_items],
+            }
+            for software_name, group_items in grouped_by_name.items()
+        ]
+
+        direct_l1_nodes: list[KnowledgeNode] = []
+        others_children: list[KnowledgeNode] = []
+        all_clusters: list[ClusterGroup] = []
+        direct_l1_debug: list[dict[str, object]] = []
+        small_node_debug: list[dict[str, object]] = []
+        big_node_debug: list[dict[str, object]] = []
+
+        small_function_items: list[ClusterItem] = []
+        small_node_map: dict[str, KnowledgeNode] = {}
+
+        for index, (software_name, group_items) in enumerate(grouped_by_name.items(), start=1):
+            group_cluster = ClusterGroup(
+                cluster_id=f"software_group_{software_name or index}",
+                source="software_name_group",
+                items=group_items,
+            )
+            all_clusters.append(group_cluster)
+            cluster_cases = [cases_by_id[item.case_id] for item in group_items]
+
+            if len(group_items) >= self.config.pipeline.new_l1_min_cases:
+                summary = await self._summarize_candidate_cluster(group_cluster, cluster_cases)
+                node = KnowledgeNode(
+                    name=summary.name,
+                    trigger=summary.trigger,
+                    background=summary.background,
+                    case_ids=[item.case_id for item in group_items],
+                )
+                direct_l1_nodes.append(node)
+                direct_l1_debug.append(
+                    {
+                        "software_name": software_name,
+                        "cluster": group_cluster.to_dict(),
+                        "summary": summary.to_dict(),
+                        "placement": "l1_direct",
+                    }
+                )
+                continue
+
+            summary = await self._summarize_candidate_cluster(group_cluster, cluster_cases)
+            small_node = KnowledgeNode(
+                name=summary.name,
+                trigger=summary.trigger,
+                background=summary.background,
+                case_ids=[item.case_id for item in group_items],
+            )
+            pseudo_id = f"software_function_{software_name or index}"
+            small_node_map[pseudo_id] = small_node
+            small_function_items.append(
+                ClusterItem(
+                    case_id=pseudo_id,
+                    text=self._node_cluster_text(summary),
+                    source="software_function",
+                    software_name=software_name,
+                    description=summary.name,
+                )
+            )
+            small_node_debug.append(
+                {
+                    "software_name": software_name,
+                    "cluster": group_cluster.to_dict(),
+                    "summary": summary.to_dict(),
+                    "placement": "await_big_node",
+                }
+            )
+
+        function_clusters = await cluster_items(
+            small_function_items,
+            self.config.cluster,
+            reporter=self.reporter,
+            label="software function regrouping",
+        )
+        all_clusters.extend(function_clusters)
+
+        progress = self.reporter.progress(len(function_clusters), "Summarize software big nodes")
+        for function_cluster in function_clusters:
+            child_nodes = [small_node_map[pseudo_id] for pseudo_id in function_cluster.case_ids]
+            big_case_ids = list(
+                dict.fromkeys(
+                    case_id
+                    for child in child_nodes
+                    for case_id in child.case_ids
+                )
+            )
+            cluster_cases = [cases_by_id[case_id] for case_id in big_case_ids]
+            summary = await self._summarize_candidate_cluster(function_cluster, cluster_cases)
+            big_node = KnowledgeNode(
+                name=summary.name,
+                trigger=summary.trigger,
+                background=summary.background,
+                children=child_nodes,
+                case_ids=big_case_ids,
+            )
+            placement = "l1" if len(big_case_ids) >= self.config.pipeline.new_l1_min_cases else "others"
+            if placement == "l1":
+                direct_l1_nodes.append(big_node)
+            else:
+                others_children.append(big_node)
+            big_node_debug.append(
+                {
+                    "cluster": function_cluster.to_dict(),
+                    "summary": summary.to_dict(),
+                    "placement": placement,
+                    "aggregated_case_ids": big_case_ids,
+                    "children": [child.to_debug_dict() for child in child_nodes],
+                }
+            )
+            progress.update(1)
+        progress.close()
+
+        return {
+            "new_l1": direct_l1_nodes,
+            "others": others_children,
+            "all_clusters": all_clusters,
+            "cluster_debug": {
+                "software_name_groups": software_name_debug,
+                "software_function_clusters": [group.to_dict() for group in function_clusters],
+            },
+            "node_debug": {
+                "direct_software_l1_nodes": direct_l1_debug,
+                "software_small_nodes": small_node_debug,
+                "software_big_nodes": big_node_debug,
+            },
+        }
+
+    def _group_software_items_by_name(self, items: list[ClusterItem]) -> dict[str, list[ClusterItem]]:
+        grouped_by_name: dict[str, list[ClusterItem]] = defaultdict(list)
+        canonical_names: list[str] = []
+        for item in sorted(items, key=lambda current: len(current.software_name or current.text)):
+            software_name = item.software_name.strip()
+            normalized = normalize_software_name(software_name)
+            if not normalized:
+                grouped_by_name[item.case_id].append(item)
+                continue
+
+            matched_canonical = None
+            for canonical in canonical_names:
+                probe_len = max(
+                    1,
+                    min(
+                        self.config.pipeline.software_alias_min_match,
+                        len(canonical),
+                        len(normalized),
+                    ),
+                )
+                canonical_probe = canonical[:probe_len]
+                normalized_probe = normalized[:probe_len]
+                if canonical_probe in normalized or normalized_probe in canonical:
+                    matched_canonical = canonical
+                    break
+
+            if matched_canonical is None:
+                canonical_names.append(normalized)
+                matched_canonical = normalized
+
+            grouped_by_name[matched_canonical].append(item)
+        return grouped_by_name
+
+    def _node_cluster_text(self, summary: NodeSummary) -> str:
+        return f"{summary.name}\n{summary.trigger}\n{summary.background}".strip()
+
+    def _set_subtree_location(
+        self,
+        node: KnowledgeNode,
+        depth: int,
+        path: list[str],
+    ) -> None:
+        node.depth = depth
+        node.path = path
+        for child in node.children:
+            self._set_subtree_location(
+                child,
+                depth=depth + 1,
+                path=[*path, child.name],
+            )
 
     async def _resolve_classification_outcome(
         self,
