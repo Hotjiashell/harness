@@ -36,7 +36,8 @@ from .utils import (
 )
 
 
-JSON_BLOCK_PATTERN = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
+JSON_BLOCK_PATTERN = re.compile(r"```json\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
+CODE_BLOCK_PATTERN = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\s*(.*?)\s*```", re.DOTALL)
 
 
 class LLMClient(ABC):
@@ -346,22 +347,39 @@ def parse_json_payload(text: str) -> dict[str, Any]:
     if not stripped:
         raise ValueError("LLM returned empty content")
 
-    block_match = JSON_BLOCK_PATTERN.search(stripped)
-    if block_match:
-        stripped = block_match.group(1).strip()
+    candidates: list[str] = []
+    json_blocks = [match.group(1).strip() for match in JSON_BLOCK_PATTERN.finditer(stripped)]
+    if json_blocks:
+        candidates.extend(json_blocks)
+    else:
+        generic_blocks = [match.group(1).strip() for match in CODE_BLOCK_PATTERN.finditer(stripped)]
+        candidates.extend(generic_blocks)
+    candidates.append(stripped)
 
-    try:
-        payload = json.loads(stripped)
-    except json.JSONDecodeError:
-        start = stripped.find("{")
-        end = stripped.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        payload = json.loads(stripped[start : end + 1])
+    last_error: Exception | None = None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            start = candidate.find("{")
+            end = candidate.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                continue
+            try:
+                payload = json.loads(candidate[start : end + 1])
+            except json.JSONDecodeError as inner_exc:
+                last_error = inner_exc
+                continue
+        if not isinstance(payload, dict):
+            raise ValueError(f"Expected JSON object, got: {payload}")
+        return payload
 
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected JSON object, got: {payload}")
-    return payload
+    if last_error is not None:
+        raise last_error
+    raise ValueError("Failed to parse JSON payload from LLM response")
 
 
 def create_llm_client(config: HarnessConfig) -> LLMClient:
