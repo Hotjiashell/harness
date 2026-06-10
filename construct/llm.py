@@ -15,6 +15,7 @@ from config import HarnessConfig
 from .models import (
     CaseRecord,
     ClassificationResult,
+    ClusterNodeSummary,
     ClusterGroup,
     DiscoveryResult,
     KnowledgeNode,
@@ -26,6 +27,7 @@ from .prompts import (
     build_child_summary_prompt,
     build_classification_prompt,
     build_discovery_prompt,
+    build_software_name_group_summary_prompt,
 )
 from .utils import (
     extract_english_candidates,
@@ -38,6 +40,45 @@ from .utils import (
 
 JSON_BLOCK_PATTERN = re.compile(r"```json\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 CODE_BLOCK_PATTERN = re.compile(r"```(?:[a-zA-Z0-9_+-]+)?\s*(.*?)\s*```", re.DOTALL)
+PURPOSE_KEYWORDS = ("用于", "用来", "主要用于", "常用于", "适用于")
+
+
+def _normalize_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip())
+
+
+def _extract_purpose_sentence(software_name: str, texts: list[str]) -> str:
+    software_label = software_name.strip()
+    for text in texts:
+        cleaned = _normalize_whitespace(text)
+        if not cleaned:
+            continue
+        has_software_name = software_label and software_label.lower() in cleaned.lower()
+        if has_software_name and any(keyword in cleaned for keyword in PURPOSE_KEYWORDS):
+            return cleaned if cleaned.endswith("。") else f"{cleaned}。"
+        for keyword in PURPOSE_KEYWORDS:
+            if keyword not in cleaned:
+                continue
+            fragment = cleaned.split(keyword, 1)[1]
+            fragment = re.split(r"[。；;]", fragment, maxsplit=1)[0].strip("，, ：: ")
+            if fragment:
+                prefix = software_label or "该软件"
+                return f"{prefix}通常用于{fragment}。"
+    terms = top_terms(texts, limit=3)
+    if software_label and terms:
+        return f"{software_label}通常用于处理{'/'.join(terms)}等相关场景。"
+    if software_label:
+        return f"{software_label}通常用于相关业务场景。"
+    return "该软件通常用于相关业务场景。"
+
+
+def _background_mentions_purpose(background: str, software_name: str) -> bool:
+    text = _normalize_whitespace(background)
+    if not text:
+        return False
+    if software_name and software_name.lower() not in text.lower():
+        return False
+    return any(keyword in text for keyword in PURPOSE_KEYWORDS)
 
 
 class LLMClient(ABC):
@@ -62,6 +103,23 @@ class LLMClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def summarize_candidate_cluster_partitions(
+        self,
+        cluster_group: ClusterGroup,
+        cases: list[CaseRecord],
+    ) -> list[ClusterNodeSummary]:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def summarize_software_name_group(
+        self,
+        software_name: str,
+        cluster_group: ClusterGroup,
+        cases: list[CaseRecord],
+    ) -> NodeSummary:
+        raise NotImplementedError
+
+    @abstractmethod
     async def summarize_case_under_parent(
         self,
         parent: KnowledgeNode,
@@ -77,6 +135,16 @@ class LLMClient(ABC):
         cases: list[CaseRecord],
         cluster_summaries: list[str],
     ) -> NodeSummary:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def summarize_child_cluster_partitions(
+        self,
+        parent: KnowledgeNode,
+        cluster_group: ClusterGroup,
+        cases: list[CaseRecord],
+        cluster_summaries: list[str],
+    ) -> list[ClusterNodeSummary]:
         raise NotImplementedError
 
 
@@ -114,8 +182,41 @@ class OpenAICompatibleLLM(LLMClient):
         cluster_group: ClusterGroup,
         cases: list[CaseRecord],
     ) -> NodeSummary:
+        summaries = await self.summarize_candidate_cluster_partitions(cluster_group, cases)
+        first = summaries[0]
+        return NodeSummary(
+            name=first.name,
+            trigger=first.trigger,
+            background=first.background,
+        )
+
+    async def summarize_candidate_cluster_partitions(
+        self,
+        cluster_group: ClusterGroup,
+        cases: list[CaseRecord],
+    ) -> list[ClusterNodeSummary]:
         payload = await self._complete_json(build_candidate_summary_prompt(cluster_group, cases))
-        return self._normalize_summary(payload, fallback_name="候选类别")
+        return self._normalize_cluster_node_summaries(
+            payload,
+            cluster_group=cluster_group,
+            fallback_name="候选类别",
+        )
+
+    async def summarize_software_name_group(
+        self,
+        software_name: str,
+        cluster_group: ClusterGroup,
+        cases: list[CaseRecord],
+    ) -> NodeSummary:
+        payload = await self._complete_json(
+            build_software_name_group_summary_prompt(software_name, cluster_group)
+        )
+        return self._normalize_software_name_group_summary(
+            payload,
+            software_name=software_name,
+            cluster_group=cluster_group,
+            cases=cases,
+        )
 
     async def summarize_case_under_parent(
         self,
@@ -132,16 +233,159 @@ class OpenAICompatibleLLM(LLMClient):
         cases: list[CaseRecord],
         cluster_summaries: list[str],
     ) -> NodeSummary:
+        summaries = await self.summarize_child_cluster_partitions(
+            parent,
+            cluster_group,
+            cases,
+            cluster_summaries,
+        )
+        first = summaries[0]
+        return NodeSummary(
+            name=first.name,
+            trigger=first.trigger,
+            background=first.background,
+        )
+
+    async def summarize_child_cluster_partitions(
+        self,
+        parent: KnowledgeNode,
+        cluster_group: ClusterGroup,
+        cases: list[CaseRecord],
+        cluster_summaries: list[str],
+    ) -> list[ClusterNodeSummary]:
         payload = await self._complete_json(
             build_child_summary_prompt(parent, cluster_group, cases, cluster_summaries)
         )
-        return self._normalize_summary(payload, fallback_name="子类别")
+        return self._normalize_cluster_node_summaries(
+            payload,
+            cluster_group=cluster_group,
+            fallback_name="子类别",
+        )
 
     def _normalize_summary(self, payload: dict[str, Any], fallback_name: str) -> NodeSummary:
         name = str(payload.get("name", "")).strip() or fallback_name
         trigger = str(payload.get("trigger", "")).strip() or f"当问题表现为{name}相关场景时考虑该类别"
         background = str(payload.get("background", "")).strip() or f"{name}相关问题需要结合案例和父类上下文分析。"
         return NodeSummary(name=name, trigger=trigger, background=background)
+
+    def _normalize_software_name_group_summary(
+        self,
+        payload: dict[str, Any],
+        software_name: str,
+        cluster_group: ClusterGroup,
+        cases: list[CaseRecord],
+    ) -> NodeSummary:
+        software_label = software_name.strip() or "该软件"
+        summary = self._normalize_summary(payload, fallback_name=f"{software_label}相关问题")
+        name = summary.name
+        if software_label.lower() not in name.lower():
+            name = f"{software_label} {name}".strip()
+
+        trigger = summary.trigger
+        if software_label.lower() not in trigger.lower():
+            trigger = f"当问题涉及{software_label}使用，尤其是{name}相关场景时考虑该类别"
+
+        purpose_sentence = _extract_purpose_sentence(
+            software_label,
+            [
+                item.description
+                for item in cluster_group.items
+                if item.description.strip()
+            ]
+            + [
+                item.text
+                for item in cluster_group.items
+                if item.text.strip()
+            ]
+            + [case.case_name for case in cases],
+        )
+        background = summary.background
+        if not _background_mentions_purpose(background, software_label):
+            background = f"{purpose_sentence} {background}".strip()
+
+        return NodeSummary(name=name, trigger=trigger, background=background)
+
+    def _normalize_cluster_node_summaries(
+        self,
+        payload: dict[str, Any],
+        cluster_group: ClusterGroup,
+        fallback_name: str,
+    ) -> list[ClusterNodeSummary]:
+        valid_item_ids = list(dict.fromkeys(cluster_group.case_ids))
+        if not valid_item_ids:
+            return []
+
+        raw_nodes = payload.get("nodes")
+        if not isinstance(raw_nodes, list):
+            raw_nodes = [payload]
+        raw_nodes = [node for node in raw_nodes if isinstance(node, dict)]
+        if not raw_nodes:
+            raw_nodes = [{}]
+
+        if len(raw_nodes) > 3:
+            merged_nodes = list(raw_nodes[:3])
+            overflow_item_ids: list[str] = []
+            for extra_node in raw_nodes[3:]:
+                raw_item_ids = extra_node.get("item_ids")
+                if isinstance(raw_item_ids, list):
+                    overflow_item_ids.extend(str(item_id) for item_id in raw_item_ids)
+            merged_last_item_ids = merged_nodes[-1].get("item_ids")
+            if isinstance(merged_last_item_ids, list):
+                merged_last_item_ids.extend(overflow_item_ids)
+            else:
+                merged_nodes[-1]["item_ids"] = overflow_item_ids
+            raw_nodes = merged_nodes
+
+        remaining_ids = list(valid_item_ids)
+        remaining_set = set(remaining_ids)
+        results: list[ClusterNodeSummary] = []
+
+        for index, node_payload in enumerate(raw_nodes, start=1):
+            raw_item_ids = node_payload.get("item_ids")
+            normalized_item_ids: list[str] = []
+            if isinstance(raw_item_ids, list):
+                seen_item_ids: set[str] = set()
+                for raw_item_id in raw_item_ids:
+                    item_id = str(raw_item_id)
+                    if item_id not in remaining_set or item_id in seen_item_ids:
+                        continue
+                    normalized_item_ids.append(item_id)
+                    seen_item_ids.add(item_id)
+
+            if not normalized_item_ids:
+                continue
+
+            remaining_set.difference_update(normalized_item_ids)
+            remaining_ids = [item_id for item_id in remaining_ids if item_id in remaining_set]
+
+            summary = self._normalize_summary(
+                node_payload,
+                fallback_name=f"{fallback_name}{index}" if len(raw_nodes) > 1 else fallback_name,
+            )
+            results.append(
+                ClusterNodeSummary(
+                    name=summary.name,
+                    trigger=summary.trigger,
+                    background=summary.background,
+                    item_ids=normalized_item_ids,
+                )
+            )
+
+        if not results:
+            summary = self._normalize_summary(payload, fallback_name=fallback_name)
+            return [
+                ClusterNodeSummary(
+                    name=summary.name,
+                    trigger=summary.trigger,
+                    background=summary.background,
+                    item_ids=valid_item_ids,
+                )
+            ]
+
+        if remaining_ids:
+            results[0].item_ids.extend(remaining_ids)
+
+        return results
 
     async def _complete_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         last_error: Exception | None = None
@@ -278,6 +522,57 @@ class HeuristicLLM(LLMClient):
             background=self._build_background(name, cases),
         )
 
+    async def summarize_candidate_cluster_partitions(
+        self,
+        cluster_group: ClusterGroup,
+        cases: list[CaseRecord],
+    ) -> list[ClusterNodeSummary]:
+        summary = await self.summarize_candidate_cluster(cluster_group, cases)
+        return [
+            ClusterNodeSummary(
+                name=summary.name,
+                trigger=summary.trigger,
+                background=summary.background,
+                item_ids=cluster_group.case_ids,
+            )
+        ]
+
+    async def summarize_software_name_group(
+        self,
+        software_name: str,
+        cluster_group: ClusterGroup,
+        cases: list[CaseRecord],
+    ) -> NodeSummary:
+        software_label = software_name.strip() or self._infer_name(cluster_group, cases)
+        focus_terms = top_terms(
+            [
+                re.sub(re.escape(software_label), "", case.case_name, flags=re.IGNORECASE).strip(" -_：:（）()")
+                for case in cases
+            ],
+            limit=2,
+        )
+        focus = "/".join(term for term in focus_terms if term) if focus_terms else ""
+        name = f"{software_label} {focus}".strip() if focus else f"{software_label}相关问题"
+        purpose_sentence = _extract_purpose_sentence(
+            software_label,
+            [
+                item.description
+                for item in cluster_group.items
+                if item.description.strip()
+            ]
+            + [
+                item.text
+                for item in cluster_group.items
+                if item.text.strip()
+            ]
+            + [case.case_name for case in cases],
+        )
+        return NodeSummary(
+            name=name,
+            trigger=f"当问题涉及{software_label}使用，尤其是{name}相关场景时考虑该类别",
+            background=f"{purpose_sentence} 该节点汇总了{name}相关的同软件案例。",
+        )
+
     async def summarize_case_under_parent(
         self,
         parent: KnowledgeNode,
@@ -311,6 +606,28 @@ class HeuristicLLM(LLMClient):
                 "可结合该簇案例中的共性处理动作进行判断。"
             ),
         )
+
+    async def summarize_child_cluster_partitions(
+        self,
+        parent: KnowledgeNode,
+        cluster_group: ClusterGroup,
+        cases: list[CaseRecord],
+        cluster_summaries: list[str],
+    ) -> list[ClusterNodeSummary]:
+        summary = await self.summarize_child_cluster(
+            parent,
+            cluster_group,
+            cases,
+            cluster_summaries,
+        )
+        return [
+            ClusterNodeSummary(
+                name=summary.name,
+                trigger=summary.trigger,
+                background=summary.background,
+                item_ids=cluster_group.case_ids,
+            )
+        ]
 
     def _infer_name(self, cluster_group: ClusterGroup, cases: list[CaseRecord]) -> str:
         software_names = [

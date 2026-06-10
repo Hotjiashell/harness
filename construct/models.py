@@ -108,6 +108,22 @@ class NodeSummary:
 
 
 @dataclass
+class ClusterNodeSummary:
+    name: str
+    trigger: str
+    background: str
+    item_ids: list[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "trigger": self.trigger,
+            "background": self.background,
+            "item_ids": self.item_ids,
+        }
+
+
+@dataclass
 class KnowledgeNode:
     name: str
     trigger: str

@@ -9,7 +9,7 @@ from .audit import ErrorAuditCollector
 from .clustering import cluster_items
 from .io_utils import write_json
 from .llm import HeuristicLLM, LLMClient
-from .models import CaseRecord, ClusterGroup, ClusterItem, KnowledgeNode, NodeSummary
+from .models import CaseRecord, ClusterGroup, ClusterItem, ClusterNodeSummary, KnowledgeNode
 from .reporting import ConsoleReporter
 from .utils import TaskOutcome, bounded_gather_outcomes, slugify, truncate
 
@@ -136,7 +136,7 @@ class RecursiveTreeBuilder:
         factories = [
             (
                 lambda cluster_group=cluster_group, cluster_cases=cluster_cases, cluster_summaries=cluster_summaries:
-                self.llm.summarize_child_cluster(
+                self.llm.summarize_child_cluster_partitions(
                     parent,
                     cluster_group,
                     cluster_cases,
@@ -151,7 +151,7 @@ class RecursiveTreeBuilder:
             reporter=self.reporter,
             progress_label=f"Summarize child clusters for {parent.name}",
         )
-        summaries: list[NodeSummary] = []
+        summaries: list[list[ClusterNodeSummary]] = []
         for (cluster_group, cluster_cases, cluster_summaries), outcome in zip(cluster_payloads, outcomes):
             summaries.append(
                 await self._resolve_child_cluster_summary_outcome(
@@ -164,16 +164,18 @@ class RecursiveTreeBuilder:
             )
 
         results: list[KnowledgeNode] = []
-        for (cluster_group, _, _), summary in zip(cluster_payloads, summaries):
-            child = KnowledgeNode(
-                name=summary.name,
-                trigger=summary.trigger,
-                background=summary.background,
-                case_ids=cluster_group.case_ids,
-                depth=parent.depth + 1,
-                path=[*parent.path, summary.name],
-            )
-            results.append(child)
+        for (cluster_group, _, _), summary_group in zip(cluster_payloads, summaries):
+            self._log_child_cluster_partition_result(parent, cluster_group, summary_group)
+            for summary in summary_group:
+                child = KnowledgeNode(
+                    name=summary.name,
+                    trigger=summary.trigger,
+                    background=summary.background,
+                    case_ids=summary.item_ids,
+                    depth=parent.depth + 1,
+                    path=[*parent.path, summary.name],
+                )
+                results.append(child)
 
         deduplicated = self._deduplicate_names(results)
         return deduplicated
@@ -190,6 +192,25 @@ class RecursiveTreeBuilder:
     def _node_stage_name(self, node: KnowledgeNode) -> str:
         fallback = f"depth-{node.depth}"
         return slugify("-".join(node.path), fallback=fallback)
+
+    def _log_child_cluster_partition_result(
+        self,
+        parent: KnowledgeNode,
+        cluster_group: ClusterGroup,
+        summary_group: list[ClusterNodeSummary],
+    ) -> None:
+        parts = ", ".join(
+            f"{summary.name}[items={len(summary.item_ids)}]"
+            for summary in summary_group
+        )
+        self.reporter.info(
+            "Child cluster partition result: "
+            f"parent={' > '.join(parent.path)} "
+            f"cluster={cluster_group.cluster_id} "
+            f"items={len(cluster_group.case_ids)} "
+            f"nodes={len(summary_group)} "
+            f"detail={parts}"
+        )
 
     async def _resolve_case_summary_outcome(
         self,
@@ -235,8 +256,8 @@ class RecursiveTreeBuilder:
         cluster_group: ClusterGroup,
         cluster_cases: list[CaseRecord],
         cluster_summaries: list[str],
-        outcome: TaskOutcome[NodeSummary],
-    ) -> NodeSummary:
+        outcome: TaskOutcome[list[ClusterNodeSummary]],
+    ) -> list[ClusterNodeSummary]:
         if outcome.ok and outcome.value is not None:
             return outcome.value
 
@@ -245,7 +266,7 @@ class RecursiveTreeBuilder:
             f"Child cluster summary failed for {cluster_group.cluster_id} under {' > '.join(parent.path)}, using heuristic fallback"
         )
         try:
-            summary = await self.fallback_llm.summarize_child_cluster(
+            summary = await self.fallback_llm.summarize_child_cluster_partitions(
                 parent,
                 cluster_group,
                 cluster_cases,
@@ -279,8 +300,11 @@ class RecursiveTreeBuilder:
                 },
             )
             name = truncate(cluster_summaries[0], 32) if cluster_summaries else cluster_group.cluster_id
-            return NodeSummary(
-                name=name,
-                trigger=f"当{parent.name}问题进一步表现为{name}方向时考虑该子类别",
-                background=f"{name}为回退生成的子类别，请结合原始案例进一步校验。",
-            )
+            return [
+                ClusterNodeSummary(
+                    name=name,
+                    trigger=f"当{parent.name}问题进一步表现为{name}方向时考虑该子类别",
+                    background=f"{name}为回退生成的子类别，请结合原始案例进一步校验。",
+                    item_ids=cluster_group.case_ids,
+                )
+            ]

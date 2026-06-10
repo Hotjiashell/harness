@@ -10,6 +10,7 @@ from .llm import HeuristicLLM, LLMClient
 from .models import (
     CaseRecord,
     ClassificationResult,
+    ClusterNodeSummary,
     ClusterGroup,
     ClusterItem,
     DiscoveryResult,
@@ -111,6 +112,7 @@ class L1Builder:
             all_children.append(node)
 
         if others_children:
+            others_children = self._deduplicate_sibling_names(others_children)
             others_case_ids: list[str] = []
             for child in others_children:
                 others_case_ids.extend(child.case_ids)
@@ -126,6 +128,13 @@ class L1Builder:
             )
             all_children.append(others_node)
 
+        all_children = self._deduplicate_sibling_names(all_children)
+        for child in all_children:
+            if child.name == "其他":
+                child.path = ["Root", "其他"]
+                child.depth = 1
+            elif child.depth <= 1:
+                self._set_subtree_location(child, depth=1, path=["Root", child.name])
         root.children = all_children
         write_json(
             self.stage_dir / self.config.pipeline.initial_root_filename,
@@ -278,27 +287,36 @@ class L1Builder:
             progress_label=progress_label,
             log_label=log_label,
         )
-        for (cluster_group, _), summary in zip(payloads, summaries):
-            node = KnowledgeNode(
-                name=summary.name,
-                trigger=summary.trigger,
-                background=summary.background,
-                case_ids=cluster_group.case_ids,
+        for (cluster_group, _), summary_group in zip(payloads, summaries):
+            self._log_cluster_partition_result(
+                cluster_group=cluster_group,
+                summary_group=summary_group,
+                context=log_label,
             )
-            debug_entries.append(
-                {
-                    "cluster": cluster_group.to_dict(),
-                    "summary": summary.to_dict(),
-                    "case_count": len(cluster_group.case_ids),
-                    "placement": "l1"
-                    if len(cluster_group.case_ids) >= self.config.pipeline.new_l1_min_cases
-                    else "others",
-                }
-            )
-            if len(cluster_group.case_ids) >= self.config.pipeline.new_l1_min_cases:
-                new_l1.append(node)
-            else:
-                others.append(node)
+            for summary in summary_group:
+                node = KnowledgeNode(
+                    name=summary.name,
+                    trigger=summary.trigger,
+                    background=summary.background,
+                    case_ids=summary.item_ids,
+                )
+                placement = (
+                    "l1"
+                    if len(summary.item_ids) >= self.config.pipeline.new_l1_min_cases
+                    else "others"
+                )
+                debug_entries.append(
+                    {
+                        "cluster": cluster_group.to_dict(),
+                        "summary": summary.to_dict(),
+                        "case_count": len(summary.item_ids),
+                        "placement": placement,
+                    }
+                )
+                if placement == "l1":
+                    new_l1.append(node)
+                else:
+                    others.append(node)
         return {
             "new_l1": new_l1,
             "others": others,
@@ -438,14 +456,20 @@ class L1Builder:
         self.reporter.info(
             f"Software name groups ready: total={len(group_payloads)} direct_l1={direct_group_count} regroup={regroup_group_count}"
         )
-        group_summaries = await self._summarize_candidate_clusters_batch(
-            [(group_cluster, cluster_cases) for _, group_cluster, cluster_cases, _, _ in group_payloads],
+        group_summaries = await self._summarize_software_name_groups_batch(
+            [(software_name, group_cluster, cluster_cases) for software_name, group_cluster, cluster_cases, _, _ in group_payloads],
             progress_label="Summarize software name groups",
             log_label="software name groups",
         )
 
         for (software_name, group_cluster, _, is_direct_l1, pseudo_id), summary in zip(group_payloads, group_summaries):
             if is_direct_l1:
+                self.reporter.info(
+                    "Software name group summarized: "
+                    f"software={software_name or group_cluster.cluster_id} "
+                    f"cases={len(group_cluster.case_ids)} placement=l1_direct "
+                    f"node={summary.name}"
+                )
                 node = KnowledgeNode(
                     name=summary.name,
                     trigger=summary.trigger,
@@ -463,6 +487,12 @@ class L1Builder:
                 )
                 continue
 
+            self.reporter.info(
+                "Software name group summarized: "
+                f"software={software_name or group_cluster.cluster_id} "
+                f"cases={len(group_cluster.case_ids)} placement=await_big_node "
+                f"node={summary.name}"
+            )
             small_node = KnowledgeNode(
                 name=summary.name,
                 trigger=summary.trigger,
@@ -515,28 +545,62 @@ class L1Builder:
             log_label="software big nodes",
         )
 
-        for (function_cluster, child_nodes, big_case_ids, _), summary in zip(big_payloads, big_summaries):
-            big_node = KnowledgeNode(
-                name=summary.name,
-                trigger=summary.trigger,
-                background=summary.background,
-                children=child_nodes,
-                case_ids=big_case_ids,
+        for (function_cluster, child_nodes, _, _), summary_group in zip(big_payloads, big_summaries):
+            self._log_cluster_partition_result(
+                cluster_group=function_cluster,
+                summary_group=summary_group,
+                context="software big nodes",
             )
-            placement = "l1" if len(big_case_ids) >= self.config.pipeline.new_l1_min_cases else "others"
-            if placement == "l1":
-                direct_l1_nodes.append(big_node)
-            else:
-                others_children.append(big_node)
-            big_node_debug.append(
-                {
-                    "cluster": function_cluster.to_dict(),
-                    "summary": summary.to_dict(),
-                    "placement": placement,
-                    "aggregated_case_ids": big_case_ids,
-                    "children": [child.to_debug_dict() for child in child_nodes],
-                }
-            )
+            child_node_map = {
+                pseudo_id: child
+                for pseudo_id, child in zip(function_cluster.case_ids, child_nodes)
+            }
+            for summary in summary_group:
+                selected_children = [
+                    child_node_map[item_id]
+                    for item_id in summary.item_ids
+                    if item_id in child_node_map
+                ]
+                aggregated_case_ids = list(
+                    dict.fromkeys(
+                        case_id
+                        for child in selected_children
+                        for case_id in child.case_ids
+                    )
+                )
+                big_node = KnowledgeNode(
+                    name=summary.name,
+                    trigger=summary.trigger,
+                    background=summary.background,
+                    children=selected_children,
+                    case_ids=aggregated_case_ids,
+                )
+                placement = (
+                    "l1"
+                    if len(aggregated_case_ids) >= self.config.pipeline.new_l1_min_cases
+                    else "others"
+                )
+                if placement == "l1":
+                    direct_l1_nodes.append(big_node)
+                else:
+                    others_children.append(big_node)
+                self.reporter.info(
+                    "Software big node placed: "
+                    f"cluster={function_cluster.cluster_id} "
+                    f"node={summary.name} "
+                    f"child_nodes={len(selected_children)} "
+                    f"cases={len(aggregated_case_ids)} "
+                    f"placement={placement}"
+                )
+                big_node_debug.append(
+                    {
+                        "cluster": function_cluster.to_dict(),
+                        "summary": summary.to_dict(),
+                        "placement": placement,
+                        "aggregated_case_ids": aggregated_case_ids,
+                        "children": [child.to_debug_dict() for child in selected_children],
+                    }
+                )
 
         return {
             "new_l1": direct_l1_nodes,
@@ -603,6 +667,33 @@ class L1Builder:
                 depth=depth + 1,
                 path=[*path, child.name],
             )
+
+    def _deduplicate_sibling_names(self, nodes: list[KnowledgeNode]) -> list[KnowledgeNode]:
+        seen: dict[str, int] = defaultdict(int)
+        for node in nodes:
+            seen[node.name] += 1
+            if seen[node.name] > 1:
+                node.name = f"{node.name}_{seen[node.name]}"
+        return nodes
+
+    def _log_cluster_partition_result(
+        self,
+        cluster_group: ClusterGroup,
+        summary_group: list[ClusterNodeSummary],
+        context: str,
+    ) -> None:
+        parts = ", ".join(
+            f"{summary.name}[items={len(summary.item_ids)}]"
+            for summary in summary_group
+        )
+        self.reporter.info(
+            f"Cluster partition result ({context}): "
+            f"cluster={cluster_group.cluster_id} "
+            f"source={cluster_group.source} "
+            f"items={len(cluster_group.case_ids)} "
+            f"nodes={len(summary_group)} "
+            f"detail={parts}"
+        )
 
     async def _resolve_classification_outcome(
         self,
@@ -725,7 +816,7 @@ class L1Builder:
         payloads: list[tuple[ClusterGroup, list[CaseRecord]]],
         progress_label: str,
         log_label: str,
-    ) -> list[NodeSummary]:
+    ) -> list[list[ClusterNodeSummary]]:
         if not payloads:
             return []
 
@@ -734,7 +825,7 @@ class L1Builder:
             [
                 (
                     lambda cluster_group=cluster_group, cluster_cases=cluster_cases:
-                    self.llm.summarize_candidate_cluster(cluster_group, cluster_cases)
+                    self.llm.summarize_candidate_cluster_partitions(cluster_group, cluster_cases)
                 )
                 for cluster_group, cluster_cases in payloads
             ],
@@ -742,10 +833,44 @@ class L1Builder:
             reporter=self.reporter,
             progress_label=f"{progress_label} ({len(payloads)})",
         )
-        summaries: list[NodeSummary] = []
+        summaries: list[list[ClusterNodeSummary]] = []
         for (cluster_group, cluster_cases), outcome in zip(payloads, outcomes):
             summaries.append(
                 await self._resolve_candidate_cluster_summary_outcome(
+                    cluster_group,
+                    cluster_cases,
+                    outcome,
+                )
+            )
+        return summaries
+
+    async def _summarize_software_name_groups_batch(
+        self,
+        payloads: list[tuple[str, ClusterGroup, list[CaseRecord]]],
+        progress_label: str,
+        log_label: str,
+    ) -> list[NodeSummary]:
+        if not payloads:
+            return []
+
+        self.reporter.info(f"Summarizing {log_label}: count={len(payloads)}")
+        outcomes = await bounded_gather_outcomes(
+            [
+                (
+                    lambda software_name=software_name, cluster_group=cluster_group, cluster_cases=cluster_cases:
+                    self.llm.summarize_software_name_group(software_name, cluster_group, cluster_cases)
+                )
+                for software_name, cluster_group, cluster_cases in payloads
+            ],
+            self.config.llm.concurrency,
+            reporter=self.reporter,
+            progress_label=f"{progress_label} ({len(payloads)})",
+        )
+        summaries: list[NodeSummary] = []
+        for (software_name, cluster_group, cluster_cases), outcome in zip(payloads, outcomes):
+            summaries.append(
+                await self._resolve_software_name_group_summary_outcome(
+                    software_name,
                     cluster_group,
                     cluster_cases,
                     outcome,
@@ -757,8 +882,8 @@ class L1Builder:
         self,
         cluster_group: ClusterGroup,
         cluster_cases: list[CaseRecord],
-        outcome: TaskOutcome[NodeSummary],
-    ) -> NodeSummary:
+        outcome: TaskOutcome[list[ClusterNodeSummary]],
+    ) -> list[ClusterNodeSummary]:
         if outcome.ok and outcome.value is not None:
             return outcome.value
 
@@ -767,7 +892,10 @@ class L1Builder:
             f"Candidate cluster summary failed for {cluster_group.cluster_id}, using heuristic fallback"
         )
         try:
-            summary = await self.fallback_llm.summarize_candidate_cluster(cluster_group, cluster_cases)
+            summary = await self.fallback_llm.summarize_candidate_cluster_partitions(
+                cluster_group,
+                cluster_cases,
+            )
             self.audit.record_item_failure(
                 stage="l1_candidate_cluster_summary",
                 item_type="cluster",
@@ -792,8 +920,65 @@ class L1Builder:
                 },
             )
             name = truncate(cluster_cases[0].case_name, 24) if cluster_cases else cluster_group.cluster_id
+            return [
+                ClusterNodeSummary(
+                    name=name,
+                    trigger=f"当问题表现为{name}相关场景时考虑该类别",
+                    background=f"{name}为回退生成的候选类别，请结合原始案例进一步校验。",
+                    item_ids=cluster_group.case_ids,
+                )
+            ]
+
+    async def _resolve_software_name_group_summary_outcome(
+        self,
+        software_name: str,
+        cluster_group: ClusterGroup,
+        cluster_cases: list[CaseRecord],
+        outcome: TaskOutcome[NodeSummary],
+    ) -> NodeSummary:
+        if outcome.ok and outcome.value is not None:
+            return outcome.value
+
+        assert outcome.error is not None
+        self.reporter.warn(
+            f"Software name group summary failed for {cluster_group.cluster_id}, using heuristic fallback"
+        )
+        try:
+            summary = await self.fallback_llm.summarize_software_name_group(
+                software_name,
+                cluster_group,
+                cluster_cases,
+            )
+            self.audit.record_item_failure(
+                stage="l1_software_name_group_summary",
+                item_type="cluster",
+                item_id=cluster_group.cluster_id,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=True,
+                details={
+                    "software_name": software_name,
+                    "case_ids": cluster_group.case_ids,
+                },
+            )
+            return summary
+        except Exception as fallback_error:  # noqa: BLE001
+            self.audit.record_item_failure(
+                stage="l1_software_name_group_summary",
+                item_type="cluster",
+                item_id=cluster_group.cluster_id,
+                error=outcome.error,
+                fallback="heuristic",
+                fallback_succeeded=False,
+                details={
+                    "software_name": software_name,
+                    "case_ids": cluster_group.case_ids,
+                    "fallback_error": str(fallback_error),
+                },
+            )
+            software_label = software_name.strip() or cluster_group.cluster_id
             return NodeSummary(
-                name=name,
-                trigger=f"当问题表现为{name}相关场景时考虑该类别",
-                background=f"{name}为回退生成的候选类别，请结合原始案例进一步校验。",
+                name=f"{software_label}相关问题",
+                trigger=f"当问题涉及{software_label}使用时考虑该类别",
+                background=f"{software_label}通常用于相关业务场景。该节点为回退生成，请结合原始聚类进一步校验。",
             )
