@@ -29,7 +29,7 @@ def build_classification_prompt(case: CaseRecord, seed_nodes: list[KnowledgeNode
         {
             "name": node.name,
             "trigger": node.trigger,
-            "background": node.background,
+            #"background": node.background,
         }
         for node in seed_nodes
     ]
@@ -65,7 +65,7 @@ def build_discovery_prompt(case: CaseRecord) -> list[dict[str, str]]:
                 "你是知识抽取助手。"
                 "你必须只返回一个```json代码块，且不要输出额外解释。"
                 "如果案例与软件使用相关，提取软件名；否则软件名为空字符串。软件名一般形式为英文词语或英文字母缩写。忽略中文软件名。"
-                "软件用途指软件的用途，而不是案例中软件的具体功能细节，因此应该说明软件用于什么场景，而不是软件的某一个具体功能是什么，一般形式为<软件名>是用于...。"
+                "软件用途不是案例中软件的具体功能细节，而是应该说明软件用于什么场景，一般形式为<软件名>是用于...。"
                 "对于非软件或中文软件，description应该是案例内容或软件用途的简洁概括。"
             ),
         },

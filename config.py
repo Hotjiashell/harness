@@ -45,10 +45,13 @@ class PipelineSettings:
     new_l1_min_cases: int = 2
     min_cases_to_split: int = 2
     software_alias_min_match: int = 3
+    stop_after_l1: bool = False
+    resume_tree_path: Path | None = None
     console_output: bool = True
     log_timestamps: bool = True
     progress_bar_width: int = 28
     stage_dir_name: str = "intermediate"
+    initial_root_filename: str = "05_initial_root.json"
     final_tree_filename: str = "knowledge_tree.json"
     debug_tree_filename: str = "knowledge_tree_debug.json"
     config_snapshot_filename: str = "run_config.json"

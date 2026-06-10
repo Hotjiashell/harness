@@ -101,9 +101,12 @@
   - `new_l1_min_cases`
   - `min_cases_to_split`
   - `software_alias_min_match`
+  - `stop_after_l1`
+  - `resume_tree_path`
   - `console_output`
   - `log_timestamps`
   - `progress_bar_width`
+  - `initial_root_filename`
 
 ## 4. 运行方式
 
@@ -149,6 +152,43 @@ python3 -m construct --provider openai-compatible
 
 - `openai-compatible` 只覆盖 `provider`
 - `base_url`、`api_key`、`model` 仍需在 `config.py` 中配置
+
+### 只构建 L1 后停止
+
+如果你只想先跑完 `L1` 构建，再检查中间结果，可以在 `config.py` 中设置：
+
+```python
+CONFIG.pipeline.stop_after_l1 = True
+CONFIG.pipeline.resume_tree_path = None
+```
+
+此时流程会：
+
+- 完成 `L1` 分类与新节点发现
+- 生成 `intermediate/05_initial_root.json`
+- 导出当前阶段的 `knowledge_tree.json` 和 `knowledge_tree_debug.json`
+- 跳过后续 `L2/L3` 递归构建
+
+### 从 L1 中间文件续跑后续阶段
+
+如果你已经有上一轮产出的 `L1` 初始树，可以直接从该文件继续跑 `L2/L3`：
+
+```python
+CONFIG.pipeline.stop_after_l1 = False
+CONFIG.pipeline.resume_tree_path = (
+    CONFIG.paths.output_dir
+    / CONFIG.pipeline.stage_dir_name
+    / CONFIG.pipeline.initial_root_filename
+)
+```
+
+也可以把 `resume_tree_path` 指向一个已有的 `knowledge_tree_debug.json`。
+
+注意：
+
+- 续跑文件必须包含 `case_ids`
+- 因此不能使用面向消费的 `knowledge_tree.json`
+- `stop_after_l1` 和 `resume_tree_path` 不能同时设置
 
 ## 5. 输入数据要求
 

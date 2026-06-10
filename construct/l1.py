@@ -127,7 +127,10 @@ class L1Builder:
             all_children.append(others_node)
 
         root.children = all_children
-        write_json(self.stage_dir / "05_initial_root.json", root.to_debug_dict())
+        write_json(
+            self.stage_dir / self.config.pipeline.initial_root_filename,
+            root.to_debug_dict(),
+        )
         self.reporter.info(f"Initial root built with {len(root.children)} L1 children")
         return root
 
